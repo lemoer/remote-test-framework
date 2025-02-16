@@ -51,6 +51,33 @@ def ser2net_stop(child: subprocess.Popen) -> Result[None, str]:
     child.wait()
     return Ok(None)
 
+from pyroute2 import IPRoute
+
+def iface_set_static_ip(interface: str, ip_address: str, mask: int = 24) -> Result[None, str]:
+    with IPRoute() as ip:
+        try:
+            idx = ip.link_lookup(ifname=interface)[0]
+            ip.flush_addr(index=idx)
+
+            # Verify flush
+            addresses = ip.get_addr(index=idx)
+            if len(addresses) > 0:
+                return Err(f"Failed to flush IP addresses from iface {interface}")
+
+            ip.addr('add', index=idx, address=ip_address, mask=mask)
+
+            # Verify set
+            addresses = ip.get_addr(index=idx)
+            assigned_ips = [entry.get('attrs', [])[0][1] for entry in addresses]
+            if ip_address in assigned_ips:
+                return Ok(None)
+            else:
+                return Err(f"Tried to add IP {ip_address} to iface {interface}, but it wasn't there afterwards.")
+        except IndexError:
+            return Err(f"Iface {interface} not found.")
+        except PermissionError:
+            return Err(f"Root rights are necessary to set ip on iface {interface}.")
+
 def gpio_prepare_output(gpio: int, active_low: bool, gpio_name: str) -> Result[None, str]:
     export_file = "/sys/class/gpio/export"
     gpio_path = f"/sys/class/gpio/gpio{gpio}"
@@ -185,6 +212,11 @@ for device_name, device in devices.items():
         device_init_failed = True
 
 if device_init_failed:
+    exit(1)
+
+iface_set_ip_result = iface_set_static_ip("eth0", "192.168.0.2", 24)
+if is_err(iface_set_ip_result):
+    print(iface_set_ip_result.unwrap_err())
     exit(1)
 
 @app.get("/")

@@ -2,3 +2,4 @@ pyserial
 result==0.17.0
 fastapi[standard]
 uvicorn
+pyroute2
