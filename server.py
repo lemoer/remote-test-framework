@@ -87,7 +87,7 @@ def gpio_prepare_output(gpio: int, active_low: bool, gpio_name: str) -> Result[N
 
     if not os.path.isdir(gpio_path):
         with open(export_file, "w") as f:
-            f.write(f"{self.power_gpio}\n")
+            f.write(f"{gpio_path}\n")
 
         if not os.path.isdir(gpio_path):
             return Err(f"{gpio_name} gpio {gpio} could not be exported.")
@@ -132,7 +132,7 @@ from fastapi import FastAPI, HTTPException
 class Device(BaseModel):
     name: str
 
-    def prepare(self):
+    def prepare(self) -> Result[None, str]:
         return Err("not implemented")
 
     async def is_powered_on(self) -> Result[bool, str]:
@@ -236,7 +236,7 @@ async def device_power(device_name: str) -> str:
     return "on" if result.unwrap() else "off"
 
 @app.post("/{device_name}/power/off")
-async def device_off(device_name: str) -> str:
+async def device_power_off(device_name: str) -> str:
     device = devices.get(device_name)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -248,7 +248,7 @@ async def device_off(device_name: str) -> str:
     return "ok"
 
 @app.post("/{device_name}/power/on")
-async def device_on(device_name: str) -> str:
+async def device_power_on(device_name: str) -> str:
     device = devices.get(device_name)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -260,7 +260,7 @@ async def device_on(device_name: str) -> str:
     return "ok"
 
 @app.post("/{device_name}/power/cycle")
-async def device_on(device_name: str) -> str:
+async def device_power_cycle(device_name: str) -> str:
     device = devices.get(device_name)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -272,7 +272,7 @@ async def device_on(device_name: str) -> str:
     return "ok"
 
 @app.post("/{device_name}/push_reset_button/{seconds}")
-async def device_on(device_name: str, seconds: int) -> str:
+async def device_push_reset_button(device_name: str, seconds: int) -> str:
     device = devices.get(device_name)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
@@ -284,7 +284,7 @@ async def device_on(device_name: str, seconds: int) -> str:
     return "ok"
 
 @app.post("/{device_name}/flash_by_url/{url}")
-async def device_on(device_name: str, url: str) -> str:
+async def device_flash(device_name: str, url: str) -> str:
     device = devices.get(device_name)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
