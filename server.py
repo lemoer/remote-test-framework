@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 import os
+import atexit
 import shutil
 import asyncio
+import tempfile
+import requests
 import subprocess
 from result import Err, Ok, Result, is_err
 from typing import List, Dict
 from pydantic import BaseModel
+from dataclasses import dataclass
 
 def ser2net_cmd(tty_path: str, speed: int, port: int) -> Result[List[str], str]:
     ser2net_bin = shutil.which("ser2net")
@@ -46,10 +50,54 @@ def ser2net_start(tty_path: str, speed: int, port: int) -> Result[subprocess.Pop
 
     return Ok(child)
 
-def ser2net_stop(child: subprocess.Popen) -> Result[None, str]:
+def subprocess_end(child: subprocess.Popen) -> Result[None, str]:
     child.terminate()
     child.wait()
     return Ok(None)
+
+@dataclass
+class TFTPInstance:
+    iface: str
+    tftp_dir: str
+    process: subprocess.Popen
+
+def dnsmasq_tftp_command(iface: str, tmp_dir: str) -> List[str]:
+    return ["dnsmasq",
+            "--no-daemon",
+            "--port=0",
+            "--interface=" + iface,
+            "--enable-tftp",
+            "--tftp-root=" + tmp_dir]
+
+def dnsmasq_tftp_start(iface: str) -> Result[TFTPInstance, str]:
+    # create temp dir for tftpboot with random dirname
+    tftp_dir = tempfile.mkdtemp(prefix="tftp-")
+
+    cmd = dnsmasq_tftp_command(iface, tftp_dir)
+    child = subprocess.Popen(cmd)
+
+    try:
+        child.wait(timeout=0.5)
+        return Err(f"dnsmasq for {iface} exited immediately")
+    except subprocess.TimeoutExpired:
+        # good, dnsmasq didn't exit immediately
+        pass
+
+    return Ok(TFTPInstance(process=child, tftp_dir=tftp_dir, iface=iface))
+
+def tftp_provide_file(tftp_dir: str, filename: str, content: bytes) -> Result[None, str]:
+    with open(os.path.join(tftp_dir, filename), "wb") as f:
+        f.write(content)
+
+    return Ok(None)
+
+def download_file(url: str) -> Result[bytes, str]:
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        return Ok(response.content)
+    except requests.exceptions.RequestException as e:
+        return Err(str(e))
 
 from pyroute2 import IPRoute
 
@@ -129,7 +177,8 @@ def gpio_get_value(gpio: int) -> Result[int, str]:
 
 from fastapi import FastAPI, HTTPException
 
-class Device(BaseModel):
+@dataclass
+class Device:
     name: str
 
     def prepare(self) -> Result[None, str]:
@@ -147,17 +196,20 @@ class Device(BaseModel):
     async def power_cycle(self) -> Result[None, str]:
         return Err("not implemented")
 
-    async def push_reset_button(self, seconds: int) -> Result[None, str]:
+    async def reset_button_push(self) -> Result[None, str]:
         return Err("not implemented")
 
-    async def flash_by_url(self, url: str) -> Result[None, str]:
+    async def reset_button_release(self) -> Result[None, str]:
         return Err("not implemented")
 
+@dataclass
 class Device1(Device):
     power_gpio: int
-    power_gpio_inverted: bool = False
     reset_gpio: int
+    tftp_filename: str
+    power_gpio_inverted: bool = False
     reset_gpio_inverted: bool = False
+    tftp_instace: TFTPInstance | None = None
 
     def prepare(self) -> Result[None, str]:
         power_gpio_prepare_result = gpio_prepare_output(self.power_gpio, self.power_gpio_inverted, "Power")
@@ -184,17 +236,11 @@ class Device1(Device):
 
         return await self.power_on()
 
-    async def push_reset_button(self, seconds: int) -> Result[None, str]:
-        turn_gpio_on_result = gpio_set_value(self.reset_gpio, 1)
-        if is_err(turn_gpio_on_result):
-            return turn_gpio_on_result
+    async def reset_button_push(self) -> Result[None, str]:
+        return gpio_set_value(self.reset_gpio, 1)
 
-        await asyncio.sleep(seconds)
-
+    async def reset_button_release(self) -> Result[None, str]:
         return gpio_set_value(self.reset_gpio, 0)
-
-    async def flash_by_url(self, url: str) -> Result[None, str]:
-        return Err("not implemented")
 
 app = FastAPI()
 
@@ -203,7 +249,14 @@ class DevicesListResult(BaseModel):
 
 devices: Dict[str, Device] = {}
 
-devices["device1"] = Device1(name="device1", power_gpio=539, reset_gpio=529, reset_gpio_inverted=True, power_gpio_inverted=True)
+devices["device1"] = Device1(
+    name="device1",
+    power_gpio=539,
+    reset_gpio=529,
+    reset_gpio_inverted=True,
+    power_gpio_inverted=True,
+    tftp_filename="wr1043v3_tp_recovery.bin"
+)
 
 device_init_failed = False
 for device_name, device in devices.items():
@@ -214,7 +267,9 @@ for device_name, device in devices.items():
 if device_init_failed:
     exit(1)
 
-iface_set_ip_result = iface_set_static_ip("eth0", "192.168.0.2", 24)
+iface = "eth0"
+
+iface_set_ip_result = iface_set_static_ip(iface, "192.168.0.66", 24)
 if is_err(iface_set_ip_result):
     print(iface_set_ip_result.unwrap_err())
     exit(1)
@@ -271,27 +326,43 @@ async def device_power_cycle(device_name: str) -> str:
 
     return "ok"
 
-@app.post("/{device_name}/push_reset_button/{seconds}")
-async def device_push_reset_button(device_name: str, seconds: int) -> str:
+@app.post("/{device_name}/reset/push")
+async def device_push_reset_button(device_name: str) -> str:
     device = devices.get(device_name)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    result = await device.push_reset_button(seconds)
+    result = await device.reset_button_push()
     if is_err(result):
         raise HTTPException(status_code=500, detail=result.unwrap_err())
 
     return "ok"
 
-@app.post("/{device_name}/flash_by_url/{url}")
-async def device_flash(device_name: str, url: str) -> str:
+@app.post("/{device_name}/reset/release")
+async def device_release_reset_button(device_name: str) -> str:
     device = devices.get(device_name)
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    result = await device.flash_by_url(url)
+    result = await device.reset_button_release()
     if is_err(result):
         raise HTTPException(status_code=500, detail=result.unwrap_err())
+
+    return "ok"
+
+@app.post("/{device_name}/tftp-file")
+async def device_flash(device_name: str, from_url: str) -> str:
+    device = devices.get(device_name)
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    download_result = download_file(from_url)
+    if is_err(download_result):
+        raise HTTPException(status_code=500, detail=download_result.unwrap_err())
+
+    tftp_provide_result = tftp_provide_file(device.tftp_instance.tftp_dir, device.tftp_filename, download_result.unwrap())
+    if is_err(tftp_provide_result):
+        raise HTTPException(status_code=500, detail=tftp_provide_result.unwrap_err())
 
     return "ok"
 
@@ -305,18 +376,26 @@ if __name__ == "__main__":
     speed = int(sys.argv[2])
     port = int(sys.argv[3])
 
-    child = ser2net_start(tty_path, speed, port)
-    if is_err(child):
-        print(child)
+    ser2net = ser2net_start(tty_path, speed, port)
+    if is_err(ser2net):
+        print(ser2net)
         sys.exit(1)
 
-    child = child.unwrap()
+    ser2net = ser2net.unwrap()
+    atexit.register(lambda: subprocess_end(ser2net))
 
-    print(f"ser2net started with PID {child.pid}")
-    try:
-        # start the webserver
-        import uvicorn
-        uvicorn.run(app, host="127.0.0.1")
-    except KeyboardInterrupt:
-        ser2net_stop(child)
-    print("ser2net exited")
+    dnsmasq_tftp = dnsmasq_tftp_start(iface)
+    if is_err(dnsmasq_tftp):
+        print(dnsmasq_tftp)
+        sys.exit(1)
+
+    dnsmasq_tftp: TFTPInstance = dnsmasq_tftp.unwrap()
+    atexit.register(lambda: subprocess_end(dnsmasq_tftp.process))
+
+    devices["device1"].tftp_instance = dnsmasq_tftp
+
+    print(f"ser2net started with PID {ser2net.pid}")
+    print(f"dnsmasq started with PID {dnsmasq_tftp.process.pid}")
+
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1")
