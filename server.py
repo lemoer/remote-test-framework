@@ -91,6 +91,21 @@ def tftp_provide_file(tftp_dir: str, filename: str, content: bytes) -> Result[No
 
     return Ok(None)
 
+def file_set_contents(path: str, value: str) -> Result[None, str]:
+    if not os.path.exists(path):
+        return Err(f"File {path} not found")
+
+    # Check if the file already contains the value
+    with open(path) as f:
+        if f.read().strip() == value.strip():
+            return Ok(None)
+
+    with open(path, "w") as f:
+        f.write(value)
+
+    return Ok(None)
+
+
 def download_file(url: str) -> Result[bytes, str]:
     try:
         response = requests.get(url)
@@ -140,22 +155,14 @@ def gpio_prepare_output(gpio: int, active_low: bool, gpio_name: str) -> Result[N
         if not os.path.isdir(gpio_path):
             return Err(f"{gpio_name} gpio {gpio} could not be exported.")
 
-    with open(f"{gpio_path}/direction", "w") as f:
-        f.write("out\n")
-
-    with open(f"{gpio_path}/direction") as f:
-        if f.read().strip() != "out":
-            return Err(f"{gpio_name} gpio {gpio} could not be set to output mode.")
+    direction_result = file_set_contents(f"{gpio_path}/direction", "out")
+    if is_err(direction_result):
+        return direction_result
 
     active_low_file_content = "1" if active_low else "0"
-    with open(f"{gpio_path}/active_low", "w") as f:
-        f.write(active_low_file_content)
+    active_low_result = file_set_contents(f"{gpio_path}/active_low", active_low_file_content)
 
-    with open(f"{gpio_path}/value") as f:
-        if f.read().strip() != active_low_file_content:
-            return Err(f"active_low state for {gpio_name} gpio {gpio} could not be set.")
-
-    return Ok(None)
+    return active_low_result
 
 def gpio_set_value(gpio: int, value: int) -> Result[None, str]:
     gpio_path = f"/sys/class/gpio/gpio{gpio}"
