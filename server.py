@@ -150,7 +150,7 @@ def gpio_prepare_output(gpio: int, active_low: bool, gpio_name: str) -> Result[N
 
     if not os.path.isdir(gpio_path):
         with open(export_file, "w") as f:
-            f.write(f"{gpio_path}\n")
+            f.write(f"{gpio}\n")
 
         if not os.path.isdir(gpio_path):
             return Err(f"{gpio_name} gpio {gpio} could not be exported.")
